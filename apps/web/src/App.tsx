@@ -1,8 +1,10 @@
-import { useEffect } from 'react';
+import { useEffect, useSyncExternalStore } from 'react';
 import { Link, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
-import { Badge, Button, Layout, Menu, Space, Tag, Typography } from 'antd';
+import { Badge, Button, Layout, Menu, Space, Tag, Tooltip, Typography } from 'antd';
 import { get } from './api/client.js';
 import { useReminders } from './api/hooks.js';
+import { getSyncStatus, subscribeSyncStatus, useEventSync } from './api/useEventSync.js';
+import type { SyncStatus } from './api/events.js';
 import { useSession } from './stores/session.js';
 import Login from './routes/Login.js';
 import Today from './routes/Today.js';
@@ -19,11 +21,43 @@ import ShareView from './routes/ShareView.js';
 
 const { Header, Sider, Content } = Layout;
 
+const STATUS_META: Record<SyncStatus, { color: string; text: string; tip: string }> = {
+  connecting: { color: '#faad14', text: '连接中', tip: '正在建立多端事件流' },
+  online: { color: '#52c41a', text: '实时同步', tip: '素材处理、窗口变化与提醒更新会实时推送；断线重连自动补漏' },
+  reconnecting: { color: '#fa8c16', text: '重连补漏中', tip: '连接已断开，正在重连；期间事件不会丢失，重连后按序号补投' },
+  offline: { color: '#bfbfbf', text: '未连接', tip: '事件流未连接，数据仍可手动刷新' },
+};
+
+function SyncIndicator() {
+  const status = useSyncExternalStore(subscribeSyncStatus, getSyncStatus);
+  const meta = STATUS_META[status];
+  return (
+    <Tooltip title={meta.tip}>
+      <Tag
+        style={{ marginInlineEnd: 0, display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'default' }}
+      >
+        <span
+          style={{
+            display: 'inline-block',
+            width: 8,
+            height: 8,
+            borderRadius: '50%',
+            background: meta.color,
+            boxShadow: status === 'online' ? `0 0 6px ${meta.color}` : 'none',
+          }}
+        />
+        {meta.text}
+      </Tag>
+    </Tooltip>
+  );
+}
+
 function Shell({ children }: { children: React.ReactNode }) {
   const { user, libraryTz, setLibraryTz, clear } = useSession();
   const navigate = useNavigate();
   const location = useLocation();
   const { data: reminders } = useReminders('pending,notified');
+  useEventSync();
 
   useEffect(() => {
     if (!user) return;
@@ -69,6 +103,7 @@ function Shell({ children }: { children: React.ReactNode }) {
           </Typography.Text>
         </Space>
         <Space>
+          <SyncIndicator />
           <Tag color="blue">时区 {libraryTz}</Tag>
           <Typography.Text style={{ color: '#fff' }}>{user.displayName}</Typography.Text>
           <Button

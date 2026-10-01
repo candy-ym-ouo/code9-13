@@ -157,9 +157,11 @@ export async function ingestAsset(params: {
     ts,
   );
 
+  // 幂等键直接绑定素材行 ID：同一素材无论入库流程被怎样重试/补扫，只产生一条事件
   emitEvent({
     type: 'asset_processed',
     libraryId,
+    dedupKey: `asset_processed:${id}`,
     payload: { assetId: id, inspirationId, width: metadata.width ?? 0, height: metadata.height ?? 0 },
   });
 

@@ -4,7 +4,7 @@ import { getDb, newId, nowIso, parseJson, toJson } from '../db.js';
 import { config } from '../config.js';
 import { errors } from '../http/errors.js';
 import { logger } from '../logger.js';
-import { emitEvent } from './events.js';
+import { emitEvent, fanoutPending, recordEvent, type PersistedEvent } from './events.js';
 
 const DAY = 86400000;
 
@@ -60,9 +60,11 @@ export function upsertReminder(params: CreateReminderParams): { id: string; crea
     ts,
     ts,
   );
+  // 幂等键绑定提醒行：upsert 命中既有提醒时不会走到这里，同一条提醒永不重复创建事件
   emitEvent({
     type: 'reminder_created',
     libraryId: params.libraryId,
+    dedupKey: `reminder_created:${id}`,
     payload: { reminderId: id, ruleCode: params.ruleCode, title: params.title },
   });
   return { id, created: true };
@@ -73,6 +75,55 @@ export function ownerUserId(libraryId: string): string | null {
     | { owner_id: string }
     | undefined;
   return row?.owner_id ?? null;
+}
+
+/**
+ * 提醒状态迁移事件。幂等键 = 提醒行 + 目标状态：
+ * 同一次迁移无论被几个触发源（定时派发 / 手动完成 / 回填联动）执行，只产生一条事件，
+ * 多端刷新收件箱时不会因重复事件重复拉取或重复提示。
+ */
+export function emitReminderStatusChange(
+  libraryId: string,
+  reminderId: string,
+  status: ReminderStatus,
+  extra: Record<string, unknown> = {},
+): void {
+  emitEvent({
+    type: 'reminder_updated',
+    libraryId,
+    dedupKey: `reminder_status:${reminderId}:${status}`,
+    payload: { reminderId, status, ...extra },
+  });
+}
+
+/**
+ * 事务内批量联动（如回填计划时一次性完成该计划的所有提醒）。
+ * 返回待扇出事件：调用方须在事务成功提交后调用 fanoutPending ——
+ * 事件记录与业务 UPDATE 同事务原子提交，但只在提交成功后实时推送。
+ */
+export function recordRemindersDoneForPlanTx(
+  planId: string,
+  libraryId: string,
+): (PersistedEvent | null)[] {
+  const db = getDb();
+  const rows = db
+    .prepare(
+      "SELECT id FROM reminder WHERE subject_type = 'plan' AND subject_id = ? AND status IN ('pending','notified','snoozed')",
+    )
+    .all(planId) as { id: string }[];
+  if (rows.length === 0) return [];
+  const ts = nowIso();
+  db.prepare(
+    "UPDATE reminder SET status = 'done', updated_at = ? WHERE subject_type = 'plan' AND subject_id = ? AND status IN ('pending','notified','snoozed')",
+  ).run(ts, planId);
+  return rows.map((row) =>
+    recordEvent({
+      type: 'reminder_updated',
+      libraryId,
+      dedupKey: `reminder_status:${row.id}:done`,
+      payload: { reminderId: row.id, status: 'done' },
+    }),
+  );
 }
 
 /** 规则求值（文档 12.7）：内置 R1–R9。每条提醒都带 expire_at，保证终态必达。 */
@@ -366,14 +417,23 @@ export function evaluateRules(
 
 /** 终态兜底：超期未处理的提醒自动 expired，绝不长期挂 pending（验收标准 S4） */
 export function expireStaleReminders(libraryId: string, now = new Date()): number {
-  const res = getDb()
+  const db = getDb();
+  const rows = db
     .prepare(
-      `UPDATE reminder SET status = 'expired', updated_at = ?
+      `SELECT id FROM reminder
        WHERE library_id = ? AND status IN ('pending','notified','snoozed')
          AND expire_at IS NOT NULL AND expire_at < ?`,
     )
-    .run(nowIso(), libraryId, now.toISOString());
-  return res.changes;
+    .all(libraryId, now.toISOString()) as { id: string }[];
+  if (rows.length === 0) return 0;
+  const ts = nowIso();
+  db.prepare(
+    `UPDATE reminder SET status = 'expired', updated_at = ?
+     WHERE library_id = ? AND status IN ('pending','notified','snoozed')
+       AND expire_at IS NOT NULL AND expire_at < ?`,
+  ).run(ts, libraryId, now.toISOString());
+  for (const row of rows) emitReminderStatusChange(libraryId, row.id, 'expired');
+  return rows.length;
 }
 
 async function pushWebhook(libraryId: string, title: string, body: string | null): Promise<void> {
@@ -421,11 +481,7 @@ export async function dispatchReminders(
       .run(nowIso(), nowIso(), row.id as string);
     if (res.changes === 0) continue;
     notified += 1;
-    emitEvent({
-      type: 'reminder_updated',
-      libraryId,
-      payload: { reminderId: row.id, status: 'notified', title: row.title },
-    });
+    emitReminderStatusChange(libraryId, row.id as string, 'notified', { title: row.title });
     await pushWebhook(libraryId, row.title as string, (row.body as string | null) ?? null);
   }
 
@@ -437,6 +493,7 @@ export function markDone(reminderId: string, libraryId: string): void {
     .prepare("UPDATE reminder SET status = 'done', updated_at = ? WHERE id = ? AND library_id = ?")
     .run(nowIso(), reminderId, libraryId);
   if (res.changes === 0) throw errors.notFound('提醒');
+  emitReminderStatusChange(libraryId, reminderId, 'done');
 }
 
 /** 顺延：不得晚于关联窗口结束时间（否则提示改为"记录未去"） */
@@ -460,6 +517,7 @@ export function snooze(reminderId: string, libraryId: string, until: Date): void
   db.prepare(
     "UPDATE reminder SET status = 'snoozed', snooze_until = ?, due_at = ?, updated_at = ? WHERE id = ?",
   ).run(until.toISOString(), until.toISOString(), nowIso(), reminderId);
+  emitReminderStatusChange(libraryId, reminderId, 'snoozed', { until: until.toISOString() });
 }
 
 /** 忽略必须填原因（不允许静默消失） */
@@ -471,6 +529,7 @@ export function dismiss(reminderId: string, libraryId: string, reason: string): 
     )
     .run(reason, nowIso(), reminderId, libraryId);
   if (res.changes === 0) throw errors.notFound('提醒');
+  emitReminderStatusChange(libraryId, reminderId, 'dismissed');
 }
 
 export function listReminders(

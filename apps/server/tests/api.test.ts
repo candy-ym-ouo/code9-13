@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import http from 'node:http';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { Express } from 'express';
 import request from 'supertest';
@@ -445,5 +446,86 @@ describe('E10 备份与质量门', () => {
     const res = await call('get', '/api/health');
     expect(res.body.db).toBe('ok');
     expect(Object.values(res.body.dirs).every((v) => v === 'ok')).toBe(true);
+  });
+});
+
+describe('E11 多端事件同步中心（SSE）', () => {
+  it('无凭证 / 缺 clientId 被拒（401 / 400）', async () => {
+    const noAuth = await request(app).get('/api/events/stream?clientId=abcdef12');
+    expect(noAuth.status).toBe(401);
+    const noClient = await request(app).get(`/api/events/stream?token=${token}`);
+    expect(noClient.status).toBe(400);
+  });
+
+  it('真实流：?token= 可连接；断线期间事件在重连时按 Last-Event-ID 补漏且不重复', async () => {
+    const server = app.listen(0);
+    const port = (server.address() as { port: number }).port;
+    const clientId = `test-client-${Math.random().toString(36).slice(2)}`;
+
+    const openStream = (afterSeq: number | null, lastEventId?: string) =>
+      new Promise<{ body: string; req: ReturnType<typeof http.request> }>((resolve, reject) => {
+        const params = new URLSearchParams({ clientId, token });
+        if (afterSeq !== null) params.set('afterSeq', String(afterSeq));
+        const headers: Record<string, string> = {};
+        if (lastEventId) headers['Last-Event-ID'] = lastEventId;
+        const req = http.request(
+          { port, path: `/api/events/stream?${params.toString()}`, method: 'GET', headers },
+          (res) => {
+            expect(res.statusCode).toBe(200);
+            expect(res.headers['content-type']).toContain('text/event-stream');
+            let body = '';
+            res.setEncoding('utf8');
+            res.on('data', (chunk: string) => {
+              body += chunk;
+              // 收到 hello（建流/回放完成）即结束这一阶段
+              if (body.includes('event: hello')) {
+                resolve({ body, req });
+              }
+            });
+          },
+        );
+        req.on('error', reject);
+        req.setTimeout(10000, () => reject(new Error('SSE 连接超时')));
+        req.end();
+      });
+
+    try {
+      // ① 首次连接：游标从 0 开始，hello 中应带本库信息
+      const first = await openStream(0);
+      expect(first.body).toContain('event: hello');
+      first.req.destroy();
+
+      // ② 断线期间上传素材，触发真实素材处理管线 → asset_processed
+      const created = await call('post', '/api/inspirations', { title: '同步测试卡' });
+      const syncCardId = created.body.id as string;
+      // 1x1 PNG
+      const png = Buffer.from(
+        '89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d49444154789c6360000002000100ffff03000006000557bfabd40000000049454e44ae426082',
+        'hex',
+      );
+      const uploadRes = await request(app)
+        .post(`/api/inspirations/${syncCardId}/assets`)
+        .set('authorization', `Bearer ${token}`)
+        .attach('files', png, 'a.png');
+      expect(uploadRes.status).toBe(201);
+
+      // ③ 从 0 重连：必须补到断线后的素材事件，帧带正整数 id
+      const second = await openStream(0);
+      const frames = second.body.split('\n\n').filter((f) => f.includes('event: asset_processed'));
+      expect(frames.length).toBeGreaterThan(0);
+      for (const f of frames) {
+        const idLine = f.split('\n').find((l) => l.startsWith('id: '));
+        expect(Number(idLine?.slice(4))).toBeGreaterThan(0);
+      }
+      // ④ 同一素材事件在单次流中只出现一次（同一事件不得重复消费）
+      const dataSeqs = frames.map((f) => {
+        const dataLine = f.split('\n').find((l) => l.startsWith('data: ')) ?? '';
+        return (JSON.parse(dataLine.slice(6)) as { seq: number }).seq;
+      });
+      expect(new Set(dataSeqs).size).toBe(dataSeqs.length);
+      second.req.destroy();
+    } finally {
+      server.close();
+    }
   });
 });

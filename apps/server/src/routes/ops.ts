@@ -10,9 +10,10 @@ import { ctxOf } from '../http/context.js';
 import { errors } from '../http/errors.js';
 import { createBackup, exportAll, listBackups, restoreBackup } from '../services/backup.js';
 import { addTags, createInspiration, requireInspiration } from '../services/inspirations.js';
-import { subscribe } from '../services/events.js';
+import { openEventStream, pruneEventLog } from '../services/events.js';
 import { recomputeHitRate } from '../services/calibration.js';
 import { toJson } from '../db.js';
+import { verifyToken } from '../http/middleware.js';
 
 export const opsRouter = Router();
 
@@ -55,6 +56,48 @@ opsRouter.get(
     });
   }),
 );
+
+/**
+ * SSE 多端事件流：素材处理完成 / 窗口判定变化 / 提醒状态变化。
+ *
+ * 必须排在 `opsRouter.use(authenticate())` 之前自行鉴权：
+ * 浏览器 EventSource 不能加自定义头，因此除 Bearer 头外也接受 ?token=。
+ *
+ * 可靠性约定：
+ *  - 每条事件携带单调递增的 `id: <seq>`；断线重连时浏览器自动带 Last-Event-ID，
+ *    也可用 ?afterSeq= 或 ?clientId= 借助服务端持久游标补漏；
+ *  - 只回放本 library_id 的事件（SQL 层隔离，listener 层再兜一道）；
+ *  - 重复投递在连接内按 seq 去重；业务侧按 dedup_key 保证同一事件只落一次。
+ */
+opsRouter.get('/events/stream', (req, res) => {
+  const authHeader = req.header('authorization');
+  const headerToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : undefined;
+  const queryToken = typeof req.query.token === 'string' ? req.query.token : undefined;
+  const auth = verifyToken(headerToken ?? queryToken);
+  if (!auth) {
+    res.status(401).json({ error: { code: 'AUTH_REQUIRED', message: '事件流需要登录', details: {} } });
+    return;
+  }
+  const libraryId = auth.libraryId;
+  const clientId =
+    typeof req.query.clientId === 'string' && /^[a-zA-Z0-9_-]{8,128}$/.test(req.query.clientId)
+      ? req.query.clientId
+      : null;
+  if (!clientId) {
+    res
+      .status(400)
+      .json({ error: { code: 'BAD_REQUEST', message: '缺少 clientId（每台设备的稳定标识）', details: {} } });
+    return;
+  }
+  const afterSeqRaw = req.query.afterSeq;
+  const afterSeq =
+    typeof afterSeqRaw === 'string' && /^\d+$/.test(afterSeqRaw) ? Number(afterSeqRaw) : undefined;
+  const lastEventId = req.header('last-event-id');
+
+  pruneEventLog();
+  const handle = openEventStream(res, libraryId, { clientId, lastEventId, afterSeq });
+  req.on('close', () => handle.unsubscribe());
+});
 
 /**
  * 注意：Router.use() 对「所有经过该 router 的请求」生效，
@@ -214,20 +257,3 @@ opsRouter.post(
     ok(res, { duplicate: false, result }, 201);
   }),
 );
-
-/** SSE：图片处理完成、窗口判定变化、提醒状态变化 */
-opsRouter.get('/events/stream', (req, res) => {
-  const ctx = ctxOf(req);
-  res.writeHead(200, {
-    'content-type': 'text/event-stream',
-    'cache-control': 'no-cache',
-    connection: 'keep-alive',
-  });
-  res.write(`event: hello\ndata: ${JSON.stringify({ libraryId: ctx.libraryId })}\n\n`);
-  const unsubscribe = subscribe(ctx.libraryId, res);
-  const keepAlive = setInterval(() => res.write(': keep-alive\n\n'), 25000);
-  req.on('close', () => {
-    clearInterval(keepAlive);
-    unsubscribe();
-  });
-});

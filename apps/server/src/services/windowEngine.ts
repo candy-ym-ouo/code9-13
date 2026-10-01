@@ -20,7 +20,7 @@ import {
 import { getDb, newId, nowIso, parseJson, toJson } from '../db.js';
 import { errors } from '../http/errors.js';
 import { config } from '../config.js';
-import { emitEvent } from './events.js';
+import { fanoutPending, recordEvent, type PersistedEvent } from './events.js';
 import {
   getForecast,
   phenomenonHolds,
@@ -520,6 +520,11 @@ export async function computeWindowsForInspiration(
 
   const ts = nowIso();
   const dtos: ReproWindowDto[] = [];
+  // 判定跳变事件先随业务数据一起落库（同一事务，原子且可重放），提交后再实时扇出
+  const pendingEvents: (PersistedEvent | null)[] = [];
+  // 每次重算运行一个唯一标识：不同运行（定时扫描 / 用户手动重算 / 并发请求）
+  // 即便同毫秒也是两个事实；同一窗口在同一次运行中的跳变只记一条。
+  const runId = newId();
 
   const persist = db.transaction(() => {
     for (const r of results) {
@@ -573,11 +578,16 @@ export async function computeWindowsForInspiration(
       }
 
       if (prior && prior.verdict !== r.verdict) {
-        emitEvent({
-          type: 'window_changed',
-          libraryId: inspiration.library_id,
-          payload: { inspirationId, date: r.date, from: prior.verdict, to: r.verdict },
-        });
+        pendingEvents.push(
+          recordEvent({
+            type: 'window_changed',
+            libraryId: inspiration.library_id,
+            // 幂等键 = 本次计算运行 + 窗口行：同一次重算内重复触发只落一条；
+            // 删后重建是新行（新事实）；不同运行的判定刷新互不折叠。
+            dedupKey: `window_changed:${runId}:${id}`,
+            payload: { inspirationId, date: r.date, from: prior.verdict, to: r.verdict },
+          }),
+        );
       }
 
       dtos.push({
@@ -598,6 +608,9 @@ export async function computeWindowsForInspiration(
     }
   });
   persist();
+  // 事务已提交：事件与窗口数据同生共死，此刻才允许推送给在线端；
+  // 离线端在重连时按 seq 从 event_log 补到同一份事实。
+  fanoutPending(pendingEvents);
 
   return dtos;
 }

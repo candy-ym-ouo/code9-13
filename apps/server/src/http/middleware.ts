@@ -47,7 +47,9 @@ export function requestLog(req: Request, res: Response, next: NextFunction): voi
 export function authenticate(required = true) {
   return (req: Request, res: Response, next: NextFunction): void => {
     const header = req.header('authorization');
-    const token = header?.startsWith('Bearer ') ? header.slice(7) : null;
+    let token = header?.startsWith('Bearer ') ? header.slice(7) : null;
+    // EventSource / <img> 等无法携带 Authorization 头的客户端，允许用 ?token= 传递
+    if (!token && typeof req.query.token === 'string') token = req.query.token;
     if (!token) {
       if (required) {
         fail(res, errors.authRequired());
@@ -67,6 +69,16 @@ export function authenticate(required = true) {
       next();
     }
   };
+}
+
+/** 仅供无法使用标准鉴权中间件的流式端点使用（SSE 需在鉴权通过前保持响应不写出） */
+export function verifyToken(token: string | undefined): JwtPayload | null {
+  if (!token) return null;
+  try {
+    return jwt.verify(token, config.jwtSecret) as JwtPayload;
+  } catch {
+    return null;
+  }
 }
 
 export function requireOwner(req: Request): void {

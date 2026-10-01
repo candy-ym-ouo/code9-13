@@ -13,8 +13,10 @@ import {
   evaluateRules,
   listReminders,
   markDone,
+  recordRemindersDoneForPlanTx,
   snooze,
 } from '../services/reminders.js';
+import { fanoutPending } from '../services/events.js';
 import { toPlanDto, toReminderDto } from '../services/serialization.js';
 import { applyCalibration, recomputeHitRate, undoCalibration } from '../services/calibration.js';
 
@@ -226,6 +228,7 @@ workflowRouter.post(
 
     const id = newId();
     const ts = nowIso();
+    let pendingEvents: ReturnType<typeof recordRemindersDoneForPlanTx> = [];
     const run = db.transaction(() => {
       db.prepare(
         `INSERT INTO shoot_result (id, library_id, plan_id, inspiration_id, hit_level, miss_reasons,
@@ -245,11 +248,10 @@ workflowRouter.post(
         ts,
       );
       db.prepare("UPDATE shoot_plan SET status = 'done', updated_at = ? WHERE id = ?").run(ts, req.params.id);
-      db.prepare(
-        "UPDATE reminder SET status = 'done', updated_at = ? WHERE subject_type = 'plan' AND subject_id = ? AND status IN ('pending','notified','snoozed')",
-      ).run(ts, req.params.id);
+      pendingEvents = recordRemindersDoneForPlanTx(req.params.id, ctx.libraryId);
     });
     run();
+    fanoutPending(pendingEvents);
 
     const calibration = applyCalibration(ctx.libraryId, plan.inspiration_id as string, id);
     syncStatus(plan.inspiration_id as string);
