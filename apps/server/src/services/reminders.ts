@@ -60,11 +60,14 @@ export function upsertReminder(params: CreateReminderParams): { id: string; crea
     ts,
     ts,
   );
-  emitEvent({
-    type: 'reminder_created',
-    libraryId: params.libraryId,
-    payload: { reminderId: id, ruleCode: params.ruleCode, title: params.title },
-  });
+  emitEvent(
+    {
+      type: 'reminder_created',
+      libraryId: params.libraryId,
+      payload: { reminderId: id, ruleCode: params.ruleCode, title: params.title },
+    },
+    `reminder:${id}:created`,
+  );
   return { id, created: true };
 }
 
@@ -421,11 +424,15 @@ export async function dispatchReminders(
       .run(nowIso(), nowIso(), row.id as string);
     if (res.changes === 0) continue;
     notified += 1;
-    emitEvent({
-      type: 'reminder_updated',
-      libraryId,
-      payload: { reminderId: row.id, status: 'notified', title: row.title },
-    });
+    emitEvent(
+      {
+        type: 'reminder_updated',
+        libraryId,
+        payload: { reminderId: row.id, status: 'notified', title: row.title },
+      },
+      // 同一条提醒的同一次状态迁移只通知一次，派发重试/多端在线也不会重复。
+      `reminder:${row.id as string}:notified`,
+    );
     await pushWebhook(libraryId, row.title as string, (row.body as string | null) ?? null);
   }
 

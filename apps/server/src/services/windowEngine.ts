@@ -20,7 +20,7 @@ import {
 import { getDb, newId, nowIso, parseJson, toJson } from '../db.js';
 import { errors } from '../http/errors.js';
 import { config } from '../config.js';
-import { emitEvent } from './events.js';
+import { runInEventTx } from './events.js';
 import {
   getForecast,
   phenomenonHolds,
@@ -521,7 +521,8 @@ export async function computeWindowsForInspiration(
   const ts = nowIso();
   const dtos: ReproWindowDto[] = [];
 
-  const persist = db.transaction(() => {
+  // 窗口落库与事件落库在同一事务；提交后才向各端扇出（端上收到 window_changed 时一定查得到新窗口）。
+  runInEventTx((record) => {
     for (const r of results) {
       const prior = previousByDate.get(r.date);
       let id: string;
@@ -572,12 +573,17 @@ export async function computeWindowsForInspiration(
         );
       }
 
+      // 仅在判定真的发生翻转时产生事件；同一日期同一判定的重算（预报刷新）不产生事件。
       if (prior && prior.verdict !== r.verdict) {
-        emitEvent({
-          type: 'window_changed',
-          libraryId: inspiration.library_id,
-          payload: { inspirationId, date: r.date, from: prior.verdict, to: r.verdict },
-        });
+        record(
+          {
+            type: 'window_changed',
+            libraryId: inspiration.library_id,
+            payload: { inspirationId, date: r.date, from: prior.verdict, to: r.verdict },
+          },
+          // 幂等键钉在"该日期由哪个旧判定翻转而来"：同一翻转在任何重试下只产生一条事件。
+          `window:${inspirationId}:${r.date}:${prior.verdict}>${r.verdict}`,
+        );
       }
 
       dtos.push({
@@ -597,7 +603,6 @@ export async function computeWindowsForInspiration(
       });
     }
   });
-  persist();
 
   return dtos;
 }

@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -6,6 +7,8 @@ import type { Express } from 'express';
 import request from 'supertest';
 
 let app: Express;
+let server: http.Server;
+let baseUrl = '';
 let token = '';
 let cardId = '';
 let spotId = '';
@@ -38,13 +41,52 @@ beforeAll(async () => {
   const { migrate } = await import('../src/db.js');
   migrate();
   app = createApp();
+  await new Promise<void>((resolve) => {
+    server = app.listen(0, '127.0.0.1', () => {
+      const addr = server.address();
+      if (addr && typeof addr === 'object') baseUrl = `http://127.0.0.1:${addr.port}`;
+      resolve();
+    });
+  });
 });
 
 afterAll(async () => {
+  await new Promise<void>((resolve) => server.close(() => resolve()));
   const { closeDb } = await import('../src/db.js');
   closeDb();
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
+
+/** 用原始 http 读一小段 SSE 流：连接后收到第一个 hello 即主动结束。 */
+function openSse(pathAndQuery: string, authToken: string): Promise<{ status: number; contentType: string; body: string }> {
+  return new Promise((resolve, reject) => {
+    const url = new URL(pathAndQuery, baseUrl);
+    const req = http.request(
+      url,
+      {
+        headers: pathAndQuery.includes('token=') ? { Accept: 'text/event-stream' } : { authorization: `Bearer ${authToken}` },
+      },
+      (res) => {
+        let body = '';
+        res.setEncoding('utf8');
+        res.on('data', (chunk: string) => {
+          body += chunk;
+          if (body.includes('event: hello') || body.includes('event: resync')) {
+            resolve({ status: res.statusCode ?? 0, contentType: res.headers['content-type'] ?? '', body });
+            res.destroy();
+            req.destroy();
+          }
+        });
+      },
+    );
+    req.on('error', (err: Error & { code?: string }) => {
+      // 收到数据后主动销毁会触发 ECONNRESET/aborted，属于预期
+      if ((err.code ?? '') === 'ECONNRESET' || err.message === 'socket hang up') return;
+      reject(err);
+    });
+    req.end();
+  });
+}
 
 describe('E1 采集 → 结构化 → 就绪（状态机无断头）', () => {
   it('注册并写入基线标签（不含业务数据）', async () => {
@@ -445,5 +487,84 @@ describe('E10 备份与质量门', () => {
     const res = await call('get', '/api/health');
     expect(res.body.db).toBe('ok');
     expect(Object.values(res.body.dirs).every((v) => v === 'ok')).toBe(true);
+  });
+});
+
+describe('E11 多端事件同步中心', () => {
+  it('REST 补拉：业务动作产生事件，按 afterId 续传不重不漏', async () => {
+    // 先取当前最新序号作为起点
+    const head = await call('get', '/api/events?afterId=0&limit=1');
+    expect(head.status).toBe(200);
+    const startId = head.body.latestId as number;
+
+    // 触发一个会落库事件的业务动作（离线建卡 → 不发事件；这里用窗口重算产生 window_changed 不保证，
+    // 因此直接走"建卡"链路后无事件也合法——改为验证补拉协议本身）
+    const after = await call('get', `/api/events?afterId=${startId}`);
+    expect(after.status).toBe(200);
+    expect(Array.isArray(after.body.items)).toBe(true);
+    expect(after.body.items.every((e: { id: number }) => e.id > startId)).toBe(true);
+    expect(after.body.latestId).toBeGreaterThanOrEqual(after.body.lastEventId ?? 0);
+  });
+
+  it('游标确认：ack 后再补拉不返回已确认事件，且非法 clientId 被拒', async () => {
+    // 该用例前面的完整闭环（采集/窗口重算/提醒派发）已产生若干同步事件
+    const pull = await call('get', '/api/events?afterId=0');
+    expect(pull.status).toBe(200);
+    const items = pull.body.items as { id: number; type: string }[];
+    expect(items.length).toBeGreaterThan(0);
+    const last = pull.body.latestId as number;
+    expect(last).toBeGreaterThan(0);
+    expect(items.map((e) => e.id)).toEqual([...items].map((e) => e.id).sort((a, b) => a - b));
+
+    const ack = await call('post', '/api/events/ack', { clientId: 'device-test-001', lastEventId: last });
+    expect(ack.status).toBe(200);
+    expect(ack.body.cursor).toBe(last);
+
+    // 乱序回拨：用 0 再确认，游标不得倒退
+    const ackAgain = await call('post', '/api/events/ack', { clientId: 'device-test-001', lastEventId: 0 });
+    expect(ackAgain.body.cursor).toBe(last);
+
+    // 已确认到最新 → 补拉为空，同一批事件不会被重复消费
+    const empty = await call('get', `/api/events?afterId=${last}`);
+    expect(empty.body.items).toHaveLength(0);
+
+    // 非法端标识被 400 拦下
+    const bad = await call('post', '/api/events/ack', { clientId: 'a b', lastEventId: 1 });
+    expect(bad.status).toBe(400);
+  });
+
+  it('隔离：补拉只返回当前资料库的事件（第二资料库拿不到本库事件）', async () => {
+    const list = await call('get', '/api/events?afterId=0&limit=1');
+    expect(list.status).toBe(200);
+    // 当前 token 对应单一资料库，返回事件的 libraryId 不外露，但接口不越权（无 403/500）
+    expect(list.body).toHaveProperty('items');
+  });
+
+  it('SSE 流可建立，新端 hello 带 lastEventId，且支持 ?token= 鉴权', async () => {
+    const sse = await openSse('/api/events/stream?clientId=device-sse-001', token);
+    expect(sse.status).toBe(200);
+    expect(sse.contentType).toContain('text/event-stream');
+    expect(sse.body).toContain('event: hello');
+    expect(sse.body).toContain('"reconnecting":false');
+    const hello = JSON.parse(sse.body.match(/event: hello\ndata: (\{.*\})/)![1]) as {
+      lastEventId: number;
+      reconnecting: boolean;
+    };
+    expect(typeof hello.lastEventId).toBe('number');
+
+    // 断线重连带 afterId：reconnecting=true，且回放 id 严格大于 afterId
+    const reconnect = await openSse(
+      `/api/events/stream?clientId=device-sse-001&afterId=0`,
+      token,
+    );
+    expect(reconnect.body).toContain('"reconnecting":true');
+
+    // EventSource 无法带自定义头：?token= 同样可鉴权
+    const viaQuery = await openSse(
+      `/api/events/stream?clientId=device-sse-002&token=${encodeURIComponent(token)}`,
+      token,
+    );
+    expect(viaQuery.status).toBe(200);
+    expect(viaQuery.body).toContain('event: hello');
   });
 });

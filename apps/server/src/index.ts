@@ -5,6 +5,7 @@ import { migrate, getDb } from './db.js';
 import { logger } from './logger.js';
 import { scanWindowsForAllLibraries } from './jobs/windowScan.js';
 import { dispatchForAllLibraries } from './jobs/dispatch.js';
+import { pruneEventLog } from './services/events.js';
 
 export function bootstrap(): void {
   ensureDirs();
@@ -41,11 +42,22 @@ export function bootstrap(): void {
     );
   });
 
+  // 每日 03:15 清理超过保留期的同步事件日志（游标过旧的端重连时会收到 resync 全量重拉）
+  const pruneTask = cron.schedule('15 3 * * *', () => {
+    try {
+      const removed = pruneEventLog();
+      if (removed > 0) logger.info('已清理过期同步事件', { removed });
+    } catch (err) {
+      logger.error('同步事件清理失败', { error: String(err) });
+    }
+  });
+
   const shutdown = () => {
     logger.info('正在关闭服务');
     windowTask.stop();
     dailyTask.stop();
     hourlyTask.stop();
+    pruneTask.stop();
     server.close(() => {
       try {
         getDb().close();

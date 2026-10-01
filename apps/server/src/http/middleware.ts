@@ -47,7 +47,12 @@ export function requestLog(req: Request, res: Response, next: NextFunction): voi
 export function authenticate(required = true) {
   return (req: Request, res: Response, next: NextFunction): void => {
     const header = req.header('authorization');
-    const token = header?.startsWith('Bearer ') ? header.slice(7) : null;
+    let token = header?.startsWith('Bearer ') ? header.slice(7) : null;
+    // EventSource / <img> 无法带自定义头，允许用 ?token= 传递（仅限 GET，且不落访问日志正文）
+    if (!token && req.method === 'GET') {
+      const qToken = req.query.token;
+      token = typeof qToken === 'string' ? qToken : null;
+    }
     if (!token) {
       if (required) {
         fail(res, errors.authRequired());

@@ -350,6 +350,23 @@ async function main() {
   const badTiming = await req('PUT', `/inspirations/${cardId}/timing`, { timeAnchor: 'not_an_anchor' });
   check('非法参数返回 400 而不是 500', badTiming.status === 400 && badTiming.json?.error?.code === 'BAD_REQUEST', JSON.stringify(badTiming.json));
 
+  // 21. 多端事件同步中心（断线补漏 / 幂等消费）
+  const syncHead = await req('GET', '/events?afterId=0&limit=1');
+  check('事件补拉接口可用并按资料库返回', syncHead.status === 200 && Array.isArray(syncHead.json?.items));
+  const headId = syncHead.json?.latestId ?? 0;
+  const syncMissed = await req('GET', `/events?afterId=${headId}`);
+  check(
+    '补拉事件序号严格大于游标（不漏不重）',
+    (syncMissed.json?.items ?? []).every((e) => e.id > headId),
+  );
+  const clientId = `smoke-${Date.now().toString(36)}`;
+  const ack = await req('POST', '/events/ack', { clientId, lastEventId: headId });
+  check('游标确认成功', ack.status === 200 && ack.json?.cursor === headId);
+  const ackBack = await req('POST', '/events/ack', { clientId, lastEventId: 0 });
+  check('乱序/重复确认不让游标回拨', ackBack.status === 200 && ackBack.json?.cursor === headId);
+  const ackBad = await req('POST', '/events/ack', { clientId: 'bad client id', lastEventId: 1 });
+  check('非法 clientId 被 400 拒绝', ackBad.status === 400);
+
   process.stdout.write(`\n结果：通过 ${passed} 项，失败 ${failed} 项\n`);
   if (failed) {
     process.stdout.write('失败明细：\n');

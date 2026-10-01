@@ -4,6 +4,7 @@ import { Badge, Button, Layout, Menu, Space, Tag, Typography } from 'antd';
 import { get } from './api/client.js';
 import { useReminders } from './api/hooks.js';
 import { useSession } from './stores/session.js';
+import { useEventSync } from './lib/useEventSync.js';
 import Login from './routes/Login.js';
 import Today from './routes/Today.js';
 import Inbox from './routes/Inbox.js';
@@ -24,6 +25,9 @@ function Shell({ children }: { children: React.ReactNode }) {
   const navigate = useNavigate();
   const location = useLocation();
   const { data: reminders } = useReminders('pending,notified');
+
+  // 登录后开启多端事件同步（断线自动补漏，事件不重复消费）
+  useEventSync();
 
   useEffect(() => {
     if (!user) return;

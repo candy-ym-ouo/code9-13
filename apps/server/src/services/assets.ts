@@ -157,11 +157,15 @@ export async function ingestAsset(params: {
     ts,
   );
 
-  emitEvent({
-    type: 'asset_processed',
-    libraryId,
-    payload: { assetId: id, inspirationId, width: metadata.width ?? 0, height: metadata.height ?? 0 },
-  });
+  emitEvent(
+    {
+      type: 'asset_processed',
+      libraryId,
+      payload: { assetId: id, inspirationId, width: metadata.width ?? 0, height: metadata.height ?? 0 },
+    },
+    // 以素材 id 为幂等键：管线重试/补处理不会让同一张素材的"处理完成"事件重复下发。
+    `asset:${id}`,
+  );
 
   return {
     assetId: id,
